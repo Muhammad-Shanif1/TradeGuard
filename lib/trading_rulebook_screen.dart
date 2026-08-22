@@ -3,6 +3,7 @@ import 'trading_constants.dart';
 import 'trading_models.dart';
 import 'trading_widgets.dart';
 import 'dart:math' as math;
+import 'dart:async';
 
 class TradingRulebookScreen extends StatefulWidget {
   const TradingRulebookScreen({super.key});
@@ -23,6 +24,7 @@ class _TradingRulebookScreenState extends State<TradingRulebookScreen>
   List<Trade> trades = [];
   Map<String, bool> checklistState = {};
   Map<String, bool> rulebookState = {};
+  Timer? _lockoutTimer;
 
   // Controllers
   final TextEditingController _pnlController = TextEditingController();
@@ -49,7 +51,7 @@ class _TradingRulebookScreenState extends State<TradingRulebookScreen>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 5, vsync: this, initialIndex: 0);
+    _tabController = TabController(length: 6, vsync: this, initialIndex: 0);
     _tabController.addListener(() => setState(() {}));
     
     // Sync controllers
@@ -64,10 +66,17 @@ class _TradingRulebookScreenState extends State<TradingRulebookScreen>
         checklistState[item['id']] = false;
       }
     }
+
+    _lockoutTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (_isKillSwitchActive) {
+        setState(() {});
+      }
+    });
   }
 
   @override
   void dispose() {
+    _lockoutTimer?.cancel();
     _tabController.dispose();
     _pnlController.dispose();
     _journalPnlController.dispose();
@@ -125,15 +134,53 @@ class _TradingRulebookScreenState extends State<TradingRulebookScreen>
   }
 
   bool get _isKillSwitchActive {
-    final today = DateTime.now();
-    final todayLosses = trades.where((t) => 
-      !t.isAdjustment && 
-      t.timestamp.day == today.day && 
-      t.timestamp.month == today.month && 
-      t.timestamp.year == today.year &&
-      t.pnl < 0
-    ).length;
-    return todayLosses >= 2;
+    final triggerTime = _killSwitchTriggerTime;
+    if (triggerTime == null) return false;
+    
+    final now = DateTime.now();
+    final lockoutEnd = triggerTime.add(const Duration(hours: 12));
+    return now.isBefore(lockoutEnd);
+  }
+
+  DateTime? get _killSwitchTriggerTime {
+    // Group trades by day to find the 2nd loss of any day
+    Map<String, List<Trade>> tradesByDay = {};
+    for (var t in trades) {
+      if (t.isAdjustment || t.pnl >= 0) continue;
+      String dayKey = "${t.timestamp.year}-${t.timestamp.month}-${t.timestamp.day}";
+      tradesByDay.putIfAbsent(dayKey, () => []).add(t);
+    }
+    
+    DateTime? latestTrigger;
+    
+    tradesByDay.forEach((day, dayTrades) {
+      if (dayTrades.length >= 2) {
+        // Sort by timestamp
+        dayTrades.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+        DateTime triggerTime = dayTrades[1].timestamp; // The 2nd loss of that day
+        if (latestTrigger == null || triggerTime.isAfter(latestTrigger!)) {
+          latestTrigger = triggerTime;
+        }
+      }
+    });
+    
+    return latestTrigger;
+  }
+
+  String _formatDuration(Duration duration) {
+    String twoDigits(int n) => n.toString().padLeft(2, "0");
+    String twoDigitMinutes = twoDigits(duration.inMinutes.remainder(60));
+    String twoDigitSeconds = twoDigits(duration.inSeconds.remainder(60));
+    return "${twoDigits(duration.inHours)}:$twoDigitMinutes:$twoDigitSeconds";
+  }
+
+  Duration get _remainingLockoutTime {
+    final triggerTime = _killSwitchTriggerTime;
+    if (triggerTime == null) return Duration.zero;
+    
+    final lockoutEnd = triggerTime.add(const Duration(hours: 12));
+    final remaining = lockoutEnd.difference(DateTime.now());
+    return remaining.isNegative ? Duration.zero : remaining;
   }
 
   double _getWeeklyLoss() {
@@ -226,6 +273,7 @@ class _TradingRulebookScreenState extends State<TradingRulebookScreen>
                   _buildRiskTab(),
                   _buildPlaybookTab(),
                   _buildStatsTab(),
+                  _buildKillSwitchTab(),
                 ],
               ),
             ),
@@ -311,7 +359,7 @@ class _TradingRulebookScreenState extends State<TradingRulebookScreen>
   }
 
   Widget _buildTabBar() {
-    final tabs = ['HOME', 'JOURNAL', 'RISK', 'PLAYBOOK', 'STATS'];
+    final tabs = ['HOME', 'JOURNAL', 'RISK', 'PLAYBOOK', 'STATS', 'LOCKOUT'];
     return Container(
       height: 45,
       decoration: const BoxDecoration(
@@ -410,13 +458,6 @@ class _TradingRulebookScreenState extends State<TradingRulebookScreen>
               children: [
                 const TradingLabel('QUICK LOG', color: C.gold),
                 const SizedBox(height: 8),
-                if (_isKillSwitchActive)
-                  Container(
-                    margin: const EdgeInsets.only(bottom: 8),
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(color: C.red2, borderRadius: BorderRadius.circular(8), border: Border.all(color: C.red)),
-                    child: const Text('KILL SWITCH ACTIVE: 2 losses today. Trading disabled.', style: TextStyle(color: C.red, fontSize: 9, fontWeight: FontWeight.bold)),
-                  ),
                 Row(
                   children: [
                     Expanded(child: _buildQuickBigButton('+\$${limits.profitTarget.toInt()} WIN', C.green, () => _addTrade(limits.profitTarget))),
@@ -589,23 +630,6 @@ class _TradingRulebookScreenState extends State<TradingRulebookScreen>
                 const SizedBox(height: 5),
                 TextField(controller: _journalNotesController, maxLines: 2, decoration: _inputDeco('Setup description...')),
                 const SizedBox(height: 12),
-                if (_isKillSwitchActive)
-                  Container(
-                    margin: const EdgeInsets.only(bottom: 12),
-                    padding: const EdgeInsets.all(10),
-                    decoration: BoxDecoration(
-                      color: C.red2,
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: C.red),
-                    ),
-                    child: const Row(
-                      children: [
-                        Icon(Icons.block, color: C.red, size: 16),
-                        SizedBox(width: 8),
-                        Expanded(child: Text('KILL SWITCH ACTIVE: 2 LOSSES TODAY. STOP TRADING.', style: TextStyle(color: C.red, fontSize: 10, fontWeight: FontWeight.w700))),
-                      ],
-                    ),
-                  ),
                 ElevatedButton(
                   onPressed: _isKillSwitchActive ? null : () {
                     final pnl = double.tryParse(_journalPnlController.text);
@@ -1188,6 +1212,127 @@ class _TradingRulebookScreenState extends State<TradingRulebookScreen>
           // Trade Calendar
           TradingCard(
             child: TradeCalendar(dailyPnl: _getDailyPnl()),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildKillSwitchTab() {
+    final active = _isKillSwitchActive;
+    final remaining = _remainingLockoutTime;
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(20),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const SizedBox(height: 20),
+          Icon(
+            active ? Icons.lock_clock : Icons.lock_open,
+            size: 80,
+            color: active ? C.red : C.green,
+          ),
+          const SizedBox(height: 24),
+          Text(
+            active ? 'KILL SWITCH ACTIVE' : 'SYSTEM UNLOCKED',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 24,
+              fontWeight: FontWeight.w900,
+              color: active ? C.red : C.green,
+              letterSpacing: 1.5,
+            ),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            active 
+              ? 'You have hit 2 losses today. To protect your capital, all trading functions are disabled for 12 hours.'
+              : 'Trading functions are fully enabled. Remember to follow your rules and maintain discipline.',
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontSize: 14, color: C.sub, height: 1.5),
+          ),
+          const SizedBox(height: 40),
+          if (active) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(vertical: 24),
+              decoration: BoxDecoration(
+                color: C.deep,
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: C.red.withOpacity(0.3)),
+              ),
+              child: Column(
+                children: [
+                  const TradingLabel('TIME REMAINING UNTIL UNLOCK', color: C.muted, fontSize: 10),
+                  const SizedBox(height: 12),
+                  Text(
+                    _formatDuration(remaining),
+                    style: const TextStyle(
+                      fontSize: 48,
+                      fontWeight: FontWeight.w800,
+                      color: C.text,
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ] else ...[
+            Container(
+              padding: const EdgeInsets.symmetric(vertical: 24),
+              decoration: BoxDecoration(
+                color: C.deep,
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: C.green.withOpacity(0.3)),
+              ),
+              child: const Column(
+                children: [
+                  Icon(Icons.check_circle_outline, color: C.green, size: 32),
+                  SizedBox(height: 12),
+                  Text(
+                    'SAFE TO TRADE',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: C.green),
+                  ),
+                ],
+              ),
+            ),
+          ],
+          const SizedBox(height: 30),
+          TradingCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const TradingLabel('LOCKOUT RULES'),
+                const SizedBox(height: 12),
+                _buildLockoutRule('Trigger', '2 losing trades in a single calendar day.'),
+                _buildLockoutRule('Duration', 'Exactly 12 hours from the 2nd loss.'),
+                _buildLockoutRule('Scope', 'Quick Logs, Journal Logs, and Stat modifications are disabled.'),
+                _buildLockoutRule('Goal', 'Prevent revenge trading and protect your emotional capital.'),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLockoutRule(String title, String desc) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('• ', style: TextStyle(color: C.gold, fontSize: 16, fontWeight: FontWeight.bold)),
+          Expanded(
+            child: RichText(
+              text: TextSpan(
+                style: const TextStyle(fontSize: 13, color: C.sub, height: 1.4),
+                children: [
+                  TextSpan(text: '$title: ', style: const TextStyle(color: C.text, fontWeight: FontWeight.bold)),
+                  TextSpan(text: desc),
+                ],
+              ),
+            ),
           ),
         ],
       ),
